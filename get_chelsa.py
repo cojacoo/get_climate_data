@@ -217,7 +217,7 @@ def get_single_chelsa_data(chelsa_ar5,k=0,vari='bc', expi='rcp45'):
 
     return get_chelsa1(fi, vari=vari, expi=expi, store_fi='single_' + chelsa_ar5.iloc[k, 0] + '.nc')
 
-def get_model_chelsa_data(chelsa_ar5L):
+def get_model_chelsa_data(chelsa_ar5L,fixa=''):
     '''get chelsa data for single model'''
     fia = listFD(chelsa_ar5L, 'tif')
     fiv = [x.split('_')[-1].split('.')[0] for x in fia]
@@ -226,13 +226,13 @@ def get_model_chelsa_data(chelsa_ar5L):
     fi = pd.DataFrame([fia, fiv, fit, fim]).T
     fi.columns = ['address', 'variable', 'month', 'experiment']
 
-    prec = get_chelsa1(fi, vari='bc', expi='rcp45', store_fi='prec_rcp45_'+chelsa_ar5L.split('/')[-2]+'.nc')
-    tmax = get_chelsa1(fi, vari='tmax', expi='rcp45', store_fi='tmax_rcp45_' + chelsa_ar5L.split('/')[-2] + '.nc')
-    tmin = get_chelsa1(fi, vari='tmin', expi='rcp45', store_fi='tmin_rcp45_' + chelsa_ar5L.split('/')[-2] + '.nc')
+    prec = get_chelsa1(fi, vari='bc', expi='rcp45', store_fi='prec_rcp45_'+chelsa_ar5L.split('/')[-2]+'.nc', fix='temp'+fixa+'.tif', cfix='ctemp'+fixa+'.tif')
+    tmax = get_chelsa1(fi, vari='tmax', expi='rcp45', store_fi='tmax_rcp45_' + chelsa_ar5L.split('/')[-2] + '.nc', fix='temp'+fixa+'.tif', cfix='ctemp'+fixa+'.tif')
+    tmin = get_chelsa1(fi, vari='tmin', expi='rcp45', store_fi='tmin_rcp45_' + chelsa_ar5L.split('/')[-2] + '.nc', fix='temp'+fixa+'.tif', cfix='ctemp'+fixa+'.tif')
 
-    prec1 = get_chelsa1(fi, vari='bc', expi='rcp85', store_fi='prec_rcp85_' + chelsa_ar5L.split('/')[-2] + '.nc')
-    tmax1 = get_chelsa1(fi, vari='tmax', expi='rcp85', store_fi='tmax_rcp85_' + chelsa_ar5L.split('/')[-2] + '.nc')
-    tmin1 = get_chelsa1(fi, vari='tmin', expi='rcp85', store_fi='tmin_rcp85_' + chelsa_ar5L.split('/')[-2] + '.nc')
+    prec1 = get_chelsa1(fi, vari='bc', expi='rcp85', store_fi='prec_rcp85_' + chelsa_ar5L.split('/')[-2] + '.nc', fix='temp'+fixa+'.tif', cfix='ctemp'+fixa+'.tif')
+    tmax1 = get_chelsa1(fi, vari='tmax', expi='rcp85', store_fi='tmax_rcp85_' + chelsa_ar5L.split('/')[-2] + '.nc', fix='temp'+fixa+'.tif', cfix='ctemp'+fixa+'.tif')
+    tmin1 = get_chelsa1(fi, vari='tmin', expi='rcp85', store_fi='tmin_rcp85_' + chelsa_ar5L.split('/')[-2] + '.nc', fix='temp'+fixa+'.tif', cfix='ctemp'+fixa+'.tif')
 
     print('downloaded model '+chelsa_ar5L.split('/')[-2])
     return
