@@ -33,7 +33,7 @@ def ESGFquery(project='CORDEX', experiment='rcp85', time_frequency='day', domain
     #login
     lm = LogonManager()
 
-    lm.logon_with_openid(openid=cred.OPENID, password=cred.PWD)
+    lm.logon_with_openid(openid=cred.OPENID, password=cred.PWD, verify=False)
     #lm.is_logged_on()
 
     #query ESGF
