@@ -7,7 +7,16 @@ import xarray as xr
 from netCDF4 import Dataset
 from datetime import timedelta
 
-from contrail.security.onlineca.client import OnlineCaClient
+try:
+    from contrail.security.onlineca.client import OnlineCaClient
+except:
+    try:
+        from contrail.security.onlineca.client import OnlineCaClient
+    except:
+        print('- - - ! - - - ! - - - ! - - - ! - - - ! - - - ! - - - ! - - - ! - - -')
+        print('WARNING: CEDA online authentification client could not be loaded.')
+        print('- - - ! - - - ! - - - ! - - - ! - - - ! - - - ! - - - ! - - - ! - - -')
+
 from pyesgf.search import SearchConnection
 from pyesgf.logon import LogonManager
 
@@ -75,7 +84,10 @@ def ESGFfiles(ctx,dix,vari=None):
     '''return list of files from pyesgf.search.context and ONE specific dataset_id line
     dix is something like dids.loc[10]
     '''
-    files = ctx.search()[dix.name].file_context().search()
+    if type(dix)==pd.Series:
+        files = ctx.search()[dix.name].file_context().search()
+    else:
+        files = ctx.search()[dix.index[0]].file_context().search()
     fix = np.repeat('qwertzuiopqwertzuiopqwertzuiopqwertzuiopqwertzuiopqwertzuiopqwertzuiopqwertzuiopqwertzuiopqwertzuiopqwertzuiopqwertzuiopqwtzuiopqwetzuiopqwertzuiopqwertzuiopqwertzuiopqwertzuiopqwertzuiopqwertzuiopqwertzuiopqwertzuiopqwertzuiopqwertzuiopqwertzuiopqwertzuiopqwertzuiopqwertzuiopqwtzuiopqwetzuiopqwertzuiopqwertzuiop', len(files))
     i = 0
     for file in files:
@@ -87,6 +99,50 @@ def ESGFfiles(ctx,dix,vari=None):
 
     return fix
 
+def ESGF_prepquick(url,lat_min=53.1,lat_max=53.9,lon_min=6.8,lon_max=8.4):
+    '''Download data from ESGF repository of one nc file for given spatial extent.
+    Standard is the extent of Eastern Frisia at the German North Sea coast.
+    Returns xarray with data.'''
+
+    if 'ceda' in cred.OPENID:
+        session = setup_session(cred.OPENID, cred.PWD, check_url=url, username=cred.cedaUSR)
+    else:
+        session = setup_session(cred.OPENID, cred.PWD, check_url=url)
+    dataset = open_url(url, session=session)
+
+    lats = dataset.lat[:].data[0]
+    lons = dataset.lon[:].data[0]
+
+    region_sub = ((lats > lat_min) & (lats < lat_max) & (lons > lon_min) & (lons < lon_max))
+
+    # box
+    subidx = [min(np.where(region_sub)[0]),max(np.where(region_sub)[0]),min(np.where(region_sub)[1]),max(np.where(region_sub)[1])]
+    lonsx = lons[subidx[0]:subidx[1], subidx[2]:subidx[3]]
+    latsx = lats[subidx[0]:subidx[1], subidx[2]:subidx[3]]
+
+    return subidx, lonsx, latsx
+
+def ESGF_quickNSC_CORDEX(url,vari,subidx, lonsx, latsx):
+    if 'ceda' in cred.OPENID:
+        session = setup_session(cred.OPENID, cred.PWD, check_url=url, username=cred.cedaUSR)
+    else:
+        session = setup_session(cred.OPENID, cred.PWD, check_url=url)
+    dataset = open_url(url, session=session)
+
+    dummy = dataset[vari][:,subidx[0]:subidx[1], subidx[2]:subidx[3]].data[0]
+
+    # timestamp
+    ti = np.repeat(pd.to_datetime('1949-12-01 00:00:00'), dataset.time.shape[0])
+    dt = dataset.time[:].data[:]
+    for i in np.arange(dataset.time.shape[0]):
+        ti[i] = ti[i] + timedelta(days=dt[i])
+
+    # build xarray
+    dsx = xr.Dataset({vari: (['time', 'x', 'y'], dummy)},
+                     coords={'lon': (['x', 'y'], lonsx),
+                             'lat': (['x', 'y'], latsx),
+                             'time': ti})
+    return dsx
 
 def ESGF_getdata(url,lat_min=53.1,lat_max=53.9,lon_min=6.8,lon_max=8.4):
     '''Download data from ESGF repository of one nc file for given spatial extent.
@@ -138,7 +194,7 @@ def ESGF_getdata(url,lat_min=53.1,lat_max=53.9,lon_min=6.8,lon_max=8.4):
 
     return dsx
 
-def ESGF_getstack(ctx,dix,lat_min=53.1,lat_max=53.9,lon_min=6.8,lon_max=8.4,storex=True,data_out=True):
+def ESGF_getstack(ctx,dix,lat_min=53.1,lat_max=53.9,lon_min=6.8,lon_max=8.4,storex=True,data_out=True,storext='.frisia.nc'):
     '''Download data from ESGF repository of one dataset for given spatial extent.
         Standard is the extent of Eastern Frisia at the German North Sea coast.
         Returns xarray with data.
@@ -186,7 +242,7 @@ def ESGF_getstack(ctx,dix,lat_min=53.1,lat_max=53.9,lon_min=6.8,lon_max=8.4,stor
     dsm.attrs['dataset_id'] = dix.dataset_id
 
     if storex:
-        dsm.sortby('time').to_netcdf(dix.dataset_id.split('|')[0] + '.frisia.nc')
+        dsm.sortby('time').to_netcdf(dix.dataset_id.split('|')[0] + storext)
 
     print('success. check output and dataset '+dix.dataset_id.split('|')[0])
     if data_out:
@@ -198,16 +254,16 @@ def ESGF_splot(dsx,ti='2030-11-30'):
     '''plot map of one time frame (tix) in xarray of climate data'''
     from cartopy import config
     import cartopy.crs as ccrs
-    import matplotlib as plt
+    import matplotlib
 
     dummy = dsx.sel(time=ti)[dsx.attrs['var_name']].data[0]
     dummy[dummy > 1e15] = np.nan #remove nan values
 
-    ax = plt.axes(projection=ccrs.PlateCarree())
+    ax = axes(projection=ccrs.PlateCarree())
     ax.coastlines('10m')
-    plt.contourf(dsx.lon, dsx.lat, dummy, 60, transform=ccrs.PlateCarree())
-    plt.colorbar()
-    plt.title(dsx.attrs['var_name']+' @ '+str(pd.to_datetime(dsx.time[tix].data).date()))
+    contourf(dsx.lon, dsx.lat, dummy, 60, transform=ccrs.PlateCarree())
+    colorbar()
+    title(dsx.attrs['var_name']+' @ '+ti)
     return
 
 def ESGF_tplot(dsx,x=2,y=4):
