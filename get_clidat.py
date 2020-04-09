@@ -26,8 +26,9 @@ from pydap.cas.esgf import setup_session
 try:
     import get_climate_data.esgf_credentials as cred
 except:
+    print('Hello first-time user!')
     print('Please rename the esgf_credential_dummy.py file to esgf_credential.py after entering your information.')
-    print('Make sure not to include the file in the git repository to prodect your login.')
+    print('Make sure not to include the file in the git repository to protect your login.')
     raise
 
 def ESGFquery(project='CORDEX', experiment='rcp85', time_frequency='day', domain='EUR-11', variable='pr', search_conni=0):
