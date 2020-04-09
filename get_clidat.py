@@ -30,7 +30,7 @@ except:
     print('Make sure not to include the file in the git repository to prodect your login.')
     raise
 
-def ESGFquery(project='CORDEX', experiment='rcp85', time_frequency='day', domain='EUR-11', variable='pr', search_conn='http://esgf-data.dkrz.de/esg-search'):
+def ESGFquery(project='CORDEX', experiment='rcp85', time_frequency='day', domain='EUR-11', variable='pr', search_conni=0):
     '''function to connect with ESGF server and to query for data
     all parameters must be defined. returns pyesgf.search.context object for further usage
     to switch off variable give it False as parameter'''
@@ -44,8 +44,9 @@ def ESGFquery(project='CORDEX', experiment='rcp85', time_frequency='day', domain
         lm.logon_with_openid(openid=cred.OPENID, password=cred.PWD)
     #lm.is_logged_on()
 
+    search_conn = np.array(['http://esgf-data.dkrz.de/esg-search','http://esgf-index1.ceda.ac.uk/esg-search', 'http://esgf-node.llnl.gov/esg-search'])
     #query ESGF
-    conn = SearchConnection(search_conn, distrib=False)
+    conn = SearchConnection(search_conn[search_conni], distrib=False)
 
     if (project == 'CORDEX') | (project == 'reklies-index') | (project == 'CORDEX-Reklies'):
         ctx = conn.new_context(project=project, experiment=experiment, time_frequency=time_frequency, domain=domain, variable=variable)
@@ -171,13 +172,13 @@ def ESGF_getdata(url,lat_min=53.1,lat_max=53.9,lon_min=6.8,lon_max=8.4):
     dataset = open_url(url, session=session)
 
     ky = list(dataset.keys())
-    vy = ['tas', 'tasmax', 'tasmin', 'pr', 'prhmax', 'ps', 'huss', 'hurs', 'sfcWind', 'sfcWindmax', 'rsds', 'evspsbl', 'mrso', 'prc']
+    vy = ['tas', 'tasmax', 'tasmin', 'pr', 'prhmax', 'ps', 'huss', 'hurs', 'sfcWind', 'sfcWindmax', 'rsds', 'evspsbl', 'mrso', 'prc', 'rhs', 'psl', 'dtr']
 
     for a in (set(vy) & set(ky)):
         attr_n = a
         break
 
-    if 'mpi-ge' in url:
+    if ('mpi-ge' in url) | ('cmip5' in url):
         lats = dataset.lat[:].data[:]
         lons = dataset.lon[:].data[:]
 
@@ -185,19 +186,24 @@ def ESGF_getdata(url,lat_min=53.1,lat_max=53.9,lon_min=6.8,lon_max=8.4):
         region_sub_lat = ((lats > lat_min) & (lats < lat_max))
         region_sub_lon = ((lons > lon_min) & (lons < lon_max))
 
+        printi = False
         if sum(region_sub_lat)<4:
             while sum(region_sub_lat)<4:
                 lat_min -= 0.2
                 lat_max += 0.2
                 region_sub_lat = ((lats > lat_min) & (lats < lat_max))
-                print('expanded lats to between ' + str(lat_min) + ' and ' + str(lat_max))
+                printi = True
 
         if sum(region_sub_lon)<4:
             while sum(region_sub_lon)<4:
                 lon_min -= 0.2
                 lon_max += 0.2
                 region_sub_lon = ((lons > lon_min) & (lons < lon_max))
-                print('expanded lons to between ' + str(lon_min) + ' and ' + str(lon_max))
+                printi = True
+
+        if printi:
+            print('expanded lats to between ' + str(lat_min) + ' and ' + str(lat_max))
+            print('expanded lons to between ' + str(lon_min) + ' and ' + str(lon_max))
 
         subidx = [min(np.where(region_sub_lat)[0]), max(np.where(region_sub_lat)[0]), min(np.where(region_sub_lon)[0]), max(np.where(region_sub_lon)[0])]
         data = dataset[attr_n][:, subidx[0]:subidx[1] + 1, subidx[2]:subidx[3] + 1].data[:]
@@ -211,16 +217,19 @@ def ESGF_getdata(url,lat_min=53.1,lat_max=53.9,lon_min=6.8,lon_max=8.4):
             lonx = np.tile(lonx, np.shape(dummy)[1:][0]).reshape(np.shape(dummy)[1:])
 
         #timestamp
-        ti = np.repeat(pd.to_datetime('2005-01-01 00:00:00'), len(data[1]))
-        for i in np.arange(len(data[1])):
-            ti[i] = ti[i] + timedelta(days=data[1][i])
+        if ('cmip5' in url):
+            start_date = pd.to_datetime(url.split('_')[-1].split('.')[0].split('-')[0], format='%Y%m%d')
+            ti = start_date + (dataset.time.data[:]-np.floor(dataset.time.data[0][0]))*timedelta(days=1)
+
+        else:
+            start_date = pd.to_datetime('2005-01-01 00:00:00')
+            ti = start_date + dataset.time.data[:] * timedelta(days=1)
 
     else:
         lats = dataset.lat[:].data[0]
         lons = dataset.lon[:].data[0]
 
         frisia_sub = ((lats > lat_min) & (lats < lat_max) & (lons > lon_min) & (lons < lon_max))
-
         # box
         fsu1 = min(np.where(frisia_sub)[0])
         fsu2 = max(np.where(frisia_sub)[0])
@@ -268,7 +277,7 @@ def ESGF_getdata(url,lat_min=53.1,lat_max=53.9,lon_min=6.8,lon_max=8.4):
 
     return dsx
 
-def ESGF_getstack(ctx,dix,lat_min=53.1,lat_max=53.9,lon_min=6.8,lon_max=8.4,storex=True,data_out=True,storext='.frisia.nc',wrkdir=''):
+def ESGF_getstack(ctx,dix,vry=None,lat_min=53.1,lat_max=53.9,lon_min=6.8,lon_max=8.4,storex=True,data_out=True,storext='.frisia.nc',wrkdir=''):
     '''Download data from ESGF repository of one dataset for given spatial extent.
         Standard is the extent of Eastern Frisia at the German North Sea coast.
         Returns xarray with data.
@@ -279,13 +288,17 @@ def ESGF_getstack(ctx,dix,lat_min=53.1,lat_max=53.9,lon_min=6.8,lon_max=8.4,stor
     fix = ESGFfiles(ctx, dix)
     fiv = [x.split('/')[-1].split('_')[0] for x in fix]
     fix1 = pd.DataFrame([fix, fiv], index=['fix', 'vari']).T
-    print('processing '+str(len(fix1))+' files.')
+    if vry==None:
+        print('processing '+str(len(fix1))+' files.')
+    else:
+        fix1 = fix1.loc[fix1.vari == vry]
+        print('processing ' + str(len(fix1)) + ' files.')
 
     if len(fix1.vari.unique())==1:
         counti = 0
         countfail = 0
-        with progressbar.ProgressBar(max_value=len(fix)) as bar:
-            for url in fix:
+        with progressbar.ProgressBar(max_value=len(fix1)) as bar:
+            for url in fix1.iloc[:,0].values:
                 try:
                     dsx_i = ESGF_getdata(url,lat_min,lat_max,lon_min,lon_max)
                     countfail = 0
@@ -319,11 +332,15 @@ def ESGF_getstack(ctx,dix,lat_min=53.1,lat_max=53.9,lon_min=6.8,lon_max=8.4,stor
         dsm.attrs['dataset_id'] = dix.dataset_id
 
         if storex:
-            dsm.sortby('time').to_netcdf(wrkdir + dix.dataset_id.split('|')[0] + storext)
+            if vry == None:
+                dsm.sortby('time').to_netcdf(wrkdir + dix.dataset_id.split('|')[0] + storext)
+            else:
+                dsm.sortby('time').to_netcdf(wrkdir + dix.dataset_id.split('|')[0] + '_' + vry + storext)
 
     else:
         with progressbar.ProgressBar(max_value=len(fix)) as bar:
-            for varix in fix1.vari.unique():
+            vari_u = list(set(['tas', 'tasmax', 'tasmin', 'pr', 'ps', 'huss', 'sfcWind', 'rsds', 'evspsbl', 'rhs', 'psl']).intersection(list(fix1.vari.unique())))
+            for varix in vari_u:
                 for url in fix1.loc[fix1.vari==varix,'fix']:
                     counti = 0
                     countfail = 0
@@ -393,7 +410,7 @@ def ESGF_tplot(dsx,x=2,y=4):
     dsx.sel(x=x, y=y)[dsx.attrs['var_name']].plot()
     return
 
-def ESGF_cordex(redmodel=False,vy=None,expi='rcp85',lat_min=52.5, lat_max=55., lon_min=6.7, lon_max=11.,storext='.NSc.nc',wrkdir=''):
+def ESGF_cordex(redmodel=False,vy=None,expi='rcp85',lat_min=52.5, lat_max=55., lon_min=6.7, lon_max=11.,storext='.NSc.nc',wrkdir='',search_conni=0):
     import os
 
     try:
@@ -406,7 +423,7 @@ def ESGF_cordex(redmodel=False,vy=None,expi='rcp85',lat_min=52.5, lat_max=55., l
 
     for vari in vy:
         # querry ESGF data
-        ctx_m = ESGFquery(project='CORDEX', experiment=expi, time_frequency='day', domain='EUR-11', variable=vari)
+        ctx_m = ESGFquery(project='CORDEX', experiment=expi, time_frequency='day', domain='EUR-11', variable=vari, search_conni=search_conni)
         di_m = ESGFgetid(ctx_m)
         if redmodel:
             di_m1 = di_m.loc[(di_m.model == redmodel) & ((di_m.variable == 'r1i1p1') | (di_m.ensemble == 'r1i1p1'))]
@@ -482,6 +499,56 @@ def ESGF_mpi_ge(expi='rcp85', vy = ['tas', 'pr', 'ps', 'hurs', 'sfcWind', 'rsdt'
 
     return
 
+def ESGF_cmip_mon(expi='rcp85', vy = ['tas','tasmax','tasmin', 'pr', 'ps', 'huss', 'sfcWind', 'rsds', 'evspsbl'], lat_min=50.5, lat_max=57., lon_min=5.5, lon_max=12.2,storext='.NScl.nc',wrkdir=''):
+    import os
+
+
+    for vari in vy:
+        # querry ESGF data
+        ctx_m = ESGFquery(project='CMIP5', experiment=expi, time_frequency='mon', variable=vari)
+        di_m = ESGFgetid(ctx_m)
+        di_m1 = di_m.loc[di_m.variable == 'atmos'] #only atmos realm
+
+        print('ready to get '+str(len(di_m1))+' model results for '+vari+' in '+expi)
+        for j in di_m1.index:
+            if os.path.isfile(wrkdir+di_m1.loc[j,'dataset_id'].split('|')[0]+storext):
+                print(di_m1.loc[j, 'dataset_id'].split('|')[0] + storext + ' already exists. not processed again.')
+            else:
+                try:
+                    print('started to process ' + di_m1.loc[j, 'dataset_id'])
+                    dsm = ESGF_getstack(ctx_m, di_m1.loc[j], lat_min=lat_min, lat_max=lat_max, lon_min=lon_min, lon_max=lon_max,storext=storext,wrkdir=wrkdir)
+                    print('processed ' + di_m1.loc[j,'dataset_id'])
+                except:
+                    print(di_m1.loc[j, 'dataset_id']+' failed processing')
+                    print('Restart manually.')
+
+    return
+
+def ESGF_cmip_day(expi='rcp85', vy = ['tas','tasmax','tasmin', 'pr', 'psl', 'hus', 'sfcWind', 'rsds', 'rhs'], lat_min=50.5, lat_max=57., lon_min=5.5, lon_max=12.2,storext='.NScl.nc',wrkdir='',sci=0):
+    import os
+
+    for vari in vy:
+        # querry ESGF data
+        ctx_m = ESGFquery(project='CMIP5', experiment=expi, time_frequency='day', variable=vari, search_conni=sci)
+        di_m = ESGFgetid(ctx_m)
+        di_m1 = di_m.loc[di_m.variable == 'atmos'] #only atmos realm
+
+        print('ready to get '+str(len(di_m1))+' model results for '+vari+' in '+expi)
+        for j in di_m1.index:
+            if os.path.isfile(wrkdir+di_m1.loc[j,'dataset_id'].split('|')[0] + '_' + vari +storext):
+                print(di_m1.loc[j, 'dataset_id'].split('|')[0] + storext + ' already exists. not processed again.')
+            else:
+                try:
+                    print('started to process ' + di_m1.loc[j, 'dataset_id'])
+                    dsm = ESGF_getstack(ctx_m, di_m1.loc[j], vry=vari, lat_min=lat_min, lat_max=lat_max, lon_min=lon_min, lon_max=lon_max,storext=storext,wrkdir=wrkdir)
+                    print('processed ' + di_m1.loc[j,'dataset_id'])
+                except:
+                    print(di_m1.loc[j, 'dataset_id']+' failed processing')
+                    print('Restart manually.')
+
+    return
+
+
 def nc_inventory(files):
     '''
     build table of attributes from file list from ESGF downloads
@@ -504,7 +571,7 @@ def nc_inventory(files):
     for i in dids.index:
         if dids.loc[i, 'file'].split('/')[-1].split('.')[0] == 'cordex':
             dids.loc[i, 'institute'] = dids.loc[i, 'file'].split('/')[-1].split('.')[3]
-            dids.loc[i, 'model'] = dids.loc[i, 'file'].split('/')[-1].split('.')[4]
+            dids.loc[i, 'model'] = '-'.join(dids.loc[i, 'file'].split('/')[-1].split('.')[4].split('-')[1:])
             dids.loc[i, 'variable'] = dids.loc[i, 'file'].split('/')[-1].split('.')[10]
             dids.loc[i, 'ensemble'] = dids.loc[i, 'file'].split('/')[-1].split('.')[6]
             dids.loc[i, 'RCM'] = dids.loc[i, 'file'].split('/')[-1].split('.')[7]
@@ -521,15 +588,25 @@ def nc_inventory(files):
             dids.loc[i, 'experiment'] = dids.loc[i, 'file'].split('/')[-1].split('.')[4]
             dids.loc[i, 'code'] = '.'.join(
                 [dids.loc[i, 'institute'], dids.loc[i, 'model'], dids.loc[i, 'ensemble'], dids.loc[i, 'experiment']])
-        if dids.loc[i, 'file'].split('/')[-1].split('.')[0] == 'cordex-reklies':
+        elif (dids.loc[i, 'file'].split('/')[-1].split('.')[0] == 'cordex-reklies') | (dids.loc[i, 'file'].split('/')[-1].split('.')[0] == 'reklies-index'):
             dids.loc[i, 'institute'] = dids.loc[i, 'file'].split('/')[-1].split('.')[3]
-            dids.loc[i, 'model'] = dids.loc[i, 'file'].split('/')[-1].split('.')[4]
+            dids.loc[i, 'model'] = '-'.join(dids.loc[i, 'file'].split('/')[-1].split('.')[4].split('-')[1:])
             dids.loc[i, 'variable'] = dids.loc[i, 'file'].split('/')[-1].split('.')[10]
             dids.loc[i, 'ensemble'] = dids.loc[i, 'file'].split('/')[-1].split('.')[8]
             dids.loc[i, 'RCM'] = dids.loc[i, 'file'].split('/')[-1].split('.')[7]
             dids.loc[i, 'experiment'] = dids.loc[i, 'file'].split('/')[-1].split('.')[5]
             dids.loc[i, 'code'] = '.'.join(
                 [dids.loc[i, 'model'], dids.loc[i, 'ensemble'], dids.loc[i, 'RCM'], dids.loc[i, 'experiment']])
+        elif dids.loc[i, 'file'].split('/')[-1].split('.')[0] == 'cmip5':
+            dids.loc[i, 'institute'] = dids.loc[i, 'file'].split('/')[-1].split('.')[2]
+            dids.loc[i, 'model'] = dids.loc[i, 'file'].split('/')[-1].split('.')[3]
+            dids.loc[i, 'variable'] = dids.loc[i, 'file'].split('/')[-1].split('.')[9].split('_')[1]
+            dids.loc[i, 'ensemble'] = dids.loc[i, 'file'].split('/')[-1].split('.')[8]
+            dids.loc[i, 'RCM'] = dids.loc[i, 'file'].split('/')[-1].split('.')[9].split('_')[0]
+            dids.loc[i, 'experiment'] = dids.loc[i, 'file'].split('/')[-1].split('.')[4]
+            dids.loc[i, 'code'] = '.'.join(
+                [dids.loc[i, 'institute'], dids.loc[i, 'model'], dids.loc[i, 'ensemble'], dids.loc[i, 'RCM'], dids.loc[i, 'experiment']])
+
     return dids
 
 def read_CM(fix):
