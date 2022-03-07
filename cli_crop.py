@@ -9,6 +9,7 @@
 import numpy as np
 import pandas as pd
 import xarray as xr
+import numba
 
 import pyeto
 from climate_indices import indices
@@ -17,7 +18,136 @@ from get_climate_data.waterdensity import waterdensity as wd
 import SIMPLEcrop as SC
 import spotpy
 
+#packages imported later
+#import pyeto as pt
+
 # wrapper for climate model data to weather file units and expected columns
+@numba.jit
+def Te_opt(T_e, gammax, vabar):
+    maxdeltaT_e = 1.
+    maxit = 9999999
+    itc = 0
+    while maxdeltaT_e < 0.01:
+        v_e = 0.6108 * np.exp(17.27 * T_e / (T_e + 237.3))  # saturated vapour pressure at T_e (S2.5)
+        T_enew = gammax * (v_e - vabar)  # rearranged from S8.8
+        deltaT_e = T_enew - T_e
+        T_e = T_enew
+        maxdeltaT_e = np.abs(np.max(deltaT_e))
+        if itc > maxit:
+            break
+        itc += 1
+    return T_e
+
+
+def ET_SzilagyiJozsa(data, Elev, lat, windfunction_ver='1948', alpha=0.23, zerocorr=True):
+    # Taken from R package Evapotranspiration >> Danlu Guo <danlu.guo@adelaide.edu.au>
+    # Daily Actual Evapotranspiration after Szilagyi, J. 2007, doi:10.1029/2006GL028708
+    # data is assumed to be a pandas data frame with at least:
+    # T or Tmin/max - daily temperature in degree Celcius,
+    # RH or RHmin/max - daily  relative humidity in percentage,
+    # u2 - daily wind speed in meters per second
+    # Rs - daily solar radiation in Megajoule per square meter.
+    # Result in [mm/day] for EToSJ, EToPM, and EToPT reference ET
+
+    # update alphaPT according to Szilagyi and Jozsa (2008)
+    alphaPT = 1.31
+    lat_rad = lat * np.pi / 180.
+    alphaPT = 1.31
+    sigma = 4.903e-09
+    Gsc = 0.082
+    lambdax = 2.45
+
+    # add julian Days
+    J = data.index.dayofyear
+
+    # Calculating mean temperature
+    if ('Ta' in data.columns):
+        Ta = data['Ta']
+    elif ('T' in data.columns):
+        Ta = data['T']
+    else:
+        Ta = (data['Tmax'] + data[
+            'Tmin']) / 2  # Equation S2.1 in Tom McMahon's HESS 2013 paper, which in turn was based on Equation 9 in Allen et al, 1998.
+
+    # Saturated vapour pressure
+    vs_Tmax = 0.6108 * np.exp(17.27 * data['Tmax'] / (data['Tmax'] + 237.3))  # Equation S2.5
+    vs_Tmin = 0.6108 * np.exp(17.27 * data['Tmin'] / (data['Tmin'] + 237.3))  # Equation S2.5
+    vas = (vs_Tmax + vs_Tmin) / 2.  # Equation S2.6
+
+    # Vapour pressure
+    if 'RHmax' in data.columns:
+        vabar = (vs_Tmin * data['RHmax'] / 100. + vs_Tmax * data['RHmin'] / 100.) / 2.  # Equation S2.7
+        # mean relative humidity
+        RHmean = (data['RHmax'] + data['RHmin']) / 2
+
+    else:
+        vabar = (vs_Tmin + vs_Tmax) / 2 * data['RH'] / 100.
+
+    if 'Rs' in data.columns:
+        R_s = data['Rs']
+    else:
+        print('Radiation data missing')
+        return
+
+    # Calculations from data and constants for Penman
+    if 'aP' in data.columns:
+        P = data['aP']
+    else:
+        P = 101.3 * ((293. - 0.0065 * Elev) / 293.) ** 5.26  # atmospheric pressure (S2.10)
+
+    delta = 4098 * (0.6108 * np.exp((17.27 * Ta) / (Ta + 237.3))) / (
+            (Ta + 237.3) ** 2)  # slope of vapour pressure curve (S2.4)
+    gamma = 0.00163 * P / lambdax  # psychrometric constant (S2.9)
+    d_r2 = 1 + 0.033 * np.cos(2 * np.pi / 365 * J)  # dr is the inverse relative distance Earth-Sun (S3.6)
+    delta2 = 0.409 * np.sin(2 * np.pi / 365 * J - 1.39)  # solar dedication (S3.7)
+    w_s = np.arccos(-1. * np.tan(lat_rad) * np.tan(delta2))  # sunset hour angle (S3.8)
+    N = 24 / np.pi * w_s  # calculating daily values
+    R_a = (1440 / np.pi) * d_r2 * Gsc * (
+            w_s * np.sin(lat_rad) * np.sin(delta2) + np.cos(lat_rad) * np.cos(delta2) * np.sin(
+        w_s))  # extraterristrial radiation (S3.5)
+    R_so = (0.75 + (2 * 10 ** - 5) * Elev) * R_a  # clear sky radiation (S3.4)
+
+    R_nl = sigma * (0.34 - 0.14 * np.sqrt(vabar)) * ((data['Tmax'] + 273.2) ** 4 + (data['Tmin'] + 273.2) ** 4) / 2 * (
+            1.35 * R_s / R_so - 0.35)  # estimated net outgoing longwave radiation (S3.3)
+    # For vegetated surface
+    R_nsg = (1 - alpha) * R_s  # net incoming shortwave radiation (S3.2)
+    R_ng = R_nsg - R_nl  # net radiation (S3.1)
+
+    if 'u2' in data.columns:
+        u2 = data['u2']
+        if windfunction_ver == "1948":
+            f_u = 2.626 + 1.381 * u2  # wind function Penman 1948 (S4.11)
+        elif windfunction_ver == "1956":
+            f_u = 1.313 + 1.381 * u2  # wind function Penman 1956 (S4.3)
+
+        Ea = f_u * (vas - vabar)  # (S4.2)
+
+        Epenman_Daily = delta / (delta + gamma) * (R_ng / lambdax) + gamma / (
+                delta + gamma) * Ea  # Penman open-water evaporation (S4.1)
+
+    else:
+
+        Epenman_Daily = 0.047 * R_s * np.sqrt(Ta + 9.5) - 2.4 * (R_s / R_a) ** 2 + 0.09 * (Ta + 20) * (
+                1 - RHmean / 100)  # Penman open-water evaporation without wind data by Valiantzas (2006) (S4.12)
+
+    # Iteration for equilibrium temperature T_e
+    T_e = Ta
+    gammax = Ta - 1 / gamma * (1 - R_ng / (lambdax * Epenman_Daily))
+
+    T_e = Te_opt(T_e.values, gammax.values, vabar.values)
+    T_e = pd.Series(T_e, index=Ta.index)
+
+    deltaT_e = 4098 * (0.6108 * np.exp((17.27 * T_e) / (T_e + 237.3))) / (
+            (T_e + 237.3) ** 2)  # slope of vapour pressure curve (S2.4)
+    E_PT_T_e = alphaPT * (deltaT_e / (deltaT_e + gamma) * R_ng / lambdax)  # Priestley-Taylor evapotranspiration at T_e
+    E_SJ_Act_Daily = 2 * E_PT_T_e - Epenman_Daily  # actual evapotranspiration by Szilagyi and Jozsa (2008) (S8.7)
+
+    if zerocorr:
+        ET_Daily = np.fmax(E_SJ_Act_Daily, 0.)
+    else:
+        ET_Daily = E_SJ_Act_Daily
+
+    return ET_Daily, Epenman_Daily, E_PT_T_e, vabar
 
 def qair2rh(qair, temp, press = 1013.25):
     es = 6.112 * np.exp((17.67 * temp)/(temp + 243.5))
@@ -143,7 +273,204 @@ def cordex_ts(NSc, modi, coords=[53.43, 7.09]):
     return dummyp
 
 
+def cordex_ts_m(NSc, modi, mask, coords=[53.43, 7.09]):
+    '''
+    wrapper for climate model data to weather file units and expected columns
+    :param NSc: dataframe output from gc.nc_inventory
+    :param modi: index for code.unique()
+    :param mask: 2D array for spatial mask
+    :param coords: lat/lon of center point
+    :return: dataframe with daily data in the following columns [tas, tasmax, tasmin, pr, huss, rsds, ps, sfcWind, et_harg]
+    '''
+
+    if len(NSc.loc[NSc.code == NSc.code.unique()[modi]]) > 8:
+        k = 0
+        NScx = NSc.loc[(NSc.code == NSc.code.unique()[modi])]
+        NScx = NScx.loc[NScx.ensemble == NScx.ensemble.unique()[k]]
+        while len(NScx) < 8:
+            k += 1
+            NScx = NScx.loc[NScx.ensemble == NScx.ensemble.unique()[k]]
+            if k == len(NScx.ensemble.unique()) - 1:
+                break
+
+    elif len(NSc.loc[NSc.code == NSc.code.unique()[modi]]) < 4:
+        print('many missing variables!')
+    else:
+        NScx = NSc.loc[(NSc.code == NSc.code.unique()[modi])]
+
+    v = 'tas'
+    i = NScx.loc[NScx.variable == v].index[0]
+    dummy = xr.open_dataset(NScx.loc[i, 'file'])
+    dlat = coords[0]
+    tas = ESGF_m(dummy, mask)
+    if tas.mean() > 200.:
+        tas = tas - 273.15
+    dummyp = pd.DataFrame(tas)
+    apnan = True
+
+    for v in ['tasmax', 'tasmin', 'ps', 'pr', 'huss', 'hurs', 'rsds', 'sfcWind', 'dtr']:
+        try:
+            i = NScx.loc[NScx.variable == v].index[0]
+            dummy = xr.open_dataset(NScx.loc[i, 'file'])
+            if NScx.loc[i, 'variable'] == 'tasmin':
+                tasmin = ESGF_m(dummy, mask)
+                if tasmin.mean() > 200.:
+                    tasmin = tasmin - 273.15
+                dummyp = pd.concat([dummyp, tasmin], axis=1)
+            elif NScx.loc[i, 'variable'] == 'tasmax':
+                tasmax = ESGF_m(dummy, mask)
+                if tasmax.mean() > 200.:
+                    tasmax = tasmax - 273.15
+                dummyp = pd.concat([dummyp, tasmax], axis=1)
+            elif (NScx.loc[i, 'variable'] == 'dtr') & ~('tasmax' in NScx.variable.unique()):
+                dtr = ESGF_m(dummy, mask)
+                tasmax = tas + dtr / 2.
+                tasmin = tas - dtr / 2.
+                dummyp = pd.concat([dummyp, tasmax, tasmin], axis=1)
+            elif NScx.loc[i, 'variable'] == 'pr':
+                prx = ESGF_m(dummy, mask)
+                if prx.resample('1Y').sum().mean() < 400.:
+                    prx *= 86400.
+                if 'ps' in NScx.variable.values:
+                    precd = pd.concat([tas, ps, prx], axis=1)
+                    prec = precd.pr * (wd(precd.tas.values, precd.ps.values) / 1000000.)
+                else:
+                    precd = pd.concat([tas, prx], axis=1)
+                    prec = precd.pr * (wd(precd.tas.values) / 1000000.)
+                # prec.columns = ['pr']
+                dummyp = pd.concat([dummyp, prec], axis=1)
+                # prec = (wd(pd.concat([tas,ps],axis=1).tas.values,pd.concat([tas,ps],axis=1).ps.values)*(dummy.sel(x=xi,y=yi).to_dataframe().pr)*86.400)/1000.
+                # prec = 999847.0655858772*(dummy.sel(x=xi,y=yi).to_dataframe().pr)*86.400/1000.
+            elif NScx.loc[i, 'variable'] == 'huss':
+                # hu = (dummy.sel(x=xi, y=yi).to_dataframe().huss * (611. * np.exp((17.67 * (tas)) / (tas + 273.15 - 29.65))))
+                if 'ps' in NScx.variable.values:
+                    hu = qair2rh(ESGF_m(dummy, mask), tas, ps / 100.)
+                else:
+                    hu = qair2rh(ESGF_m(dummy, mask), tas)
+                hu.name = 'hu'
+                if np.mean(hu) < 1.:
+                    hu = 100. * hu
+                dummyp = pd.concat([dummyp, hu], axis=1)
+            elif NScx.loc[i, 'variable'] == 'hurs':
+                hu = ESGF_m(dummy, mask)
+                hu.name = 'hu'
+                if np.mean(hu) < 1.:
+                    hu = 100. * hu
+                dummyp = pd.concat([dummyp, hu], axis=1)
+            elif NScx.loc[i, 'variable'] == 'rsds':
+                rsds = 0.086400 * ESGF_m(dummy, mask)  # W/m2 >> MJ/m2day
+                dummyp = pd.concat([dummyp, rsds], axis=1)
+            elif NScx.loc[i, 'variable'] == 'ps':
+                ps = ESGF_m(dummy, mask)
+                if np.mean(ps) > 2000.:
+                    ps = ps / 100.
+                dummyp = pd.concat([dummyp, ps], axis=1)
+                apnan = False
+            elif NScx.loc[i, 'variable'] == 'sfcWind':
+                sfcWind = ESGF_m(dummy, mask)
+                dummyp = pd.concat([dummyp, sfcWind], axis=1)
+        except:
+            print('try failed with ' + v)
+            pass
+
+    dummyp['et_harg'] = np.nan
+    lat = pyeto.deg2rad(dlat)
+    for i in dummyp.index:
+        sol_dec = pyeto.sol_dec(i.dayofyear)
+        sha = pyeto.sunset_hour_angle(lat, sol_dec)
+        ird = pyeto.inv_rel_dist_earth_sun(i.dayofyear)
+        et_rad = pyeto.et_rad(lat, sol_dec, sha, ird)
+        dummyp.loc[i, 'et_harg'] = pyeto.hargreaves(dummyp.loc[i, 'tasmin'], dummyp.loc[i, 'tasmax'],
+                                                    dummyp.loc[i, 'tas'], et_rad)
+
+    try:
+        if apnan:
+            dummyx = dummyp[['tas', 'tasmax', 'tasmin', 'pr', 'hu', 'rsds', 'sfcWind']].copy()
+            dummyx.columns = ['Ta', 'Tmax', 'Tmin', 'Prec', 'RH', 'Rs', 'u2']
+            print('No atmospheric pressue data given. Using standard reference instead.')
+        else:
+            dummyx = dummyp[['tas', 'tasmax', 'tasmin', 'pr', 'hu', 'rsds', 'ps', 'sfcWind']].copy()
+            dummyx.columns = ['Ta', 'Tmax', 'Tmin', 'Prec', 'RH', 'Rs', 'aP', 'u2']
+            dummyx.aP = dummyx.aP * 0.1
+
+        EToSJ, EToPM2, EToPT, vabar = ET_SzilagyiJozsa(dummyx, 3., 53.4, zerocorr=True)
+        dummyp['vabar'] = vabar
+        dummyp['EToSJ'] = EToSJ
+        dummyp['EToPM'] = EToPM2
+        dummyp['EToPT'] = EToPT
+        if apnan:
+            dummyp['aP'] = np.nan
+
+    except:
+        print('Failed to calculate EToSJ.')
+        dummyp['vabar'] = np.nan
+        dummyp['EToSJ'] = np.nan
+        dummyp['EToPM'] = np.nan
+        dummyp['EToPT'] = np.nan
+        if apnan:
+            dummyp['aP'] = np.nan
+
+    dummyp['EToPM1'] = np.nan
+    if apnan:
+        EToPM = pyeto.fao56_penman_monteith(dummyp.rsds.values, dummyp['tas'].values + 273.15, dummyp.sfcWind.values,
+                                            pyeto.svp_from_t(dummyp['tas'].values), dummyp.vabar,
+                                            pyeto.delta_svp(dummyp['tas'].values),
+                                            pyeto.psy_const(1013.13 * 0.1))
+    else:
+        EToPM = pyeto.fao56_penman_monteith(dummyp.rsds.values, dummyp['tas'].values + 273.15, dummyp.sfcWind.values,
+                                     pyeto.svp_from_t(dummyp['tas'].values), dummyp.vabar,
+                                     pyeto.delta_svp(dummyp['tas'].values), pyeto.psy_const(dummyp.ps.values * 0.1))
+    EToPM = pd.Series(EToPM)
+    EToPM.index = dummyp.index
+    dummyp['EToPM1'] = EToPM
+
+    dummyp['EToHG1'] = np.nan
+    EToHG = pyeto.hargreaves(dummyx.Tmin.values, dummyx.Tmax.values, dummyx.Ta.values,
+                          pyeto.et_rad(52. * np.pi / 180., pyeto.sol_dec(dummyx.index.dayofyear.values),
+                                    pyeto.sunset_hour_angle(52. * np.pi / 180., pyeto.sol_dec(dummyx.index.dayofyear.values)),
+                                    pyeto.inv_rel_dist_earth_sun(dummyx.index.dayofyear.values)))
+    EToHG = pd.Series(EToHG)
+    EToHG.index = dummyx.index
+    dummyp['EToHG1'] = EToHG
+
+    return dummyp
+
+def ESGF_m(dsx, mask=[], var=None, agg='mean'):
+    '''spatial aggregates
+    dsx :: xarray to get spatial aggregate from
+    mask :: bool 2D array masking the area of the xarray
+    returns pandas Series of aggregated property
+    '''
+    if var == None:
+        var = dsx.attrs['var_name']
+    if mask == []:
+        mask = np.ones((dsx.dims['x'], dsx.dims['y'])).astype(np.bool)
+
+    dummy = dsx[var].data[:, mask]
+    dummy[dummy > 1e15] = np.nan  # remove nan values
+
+    if agg == 'mean':
+        dummy = np.nanmean(dummy, axis=1)
+    elif agg == 'median':
+        dummy = np.nanmedian(dummy, axis=1)
+    elif agg == 'var':
+        dummy = np.nanvar(dummy, axis=1)
+    elif type(agg) == float:
+        dummy = np.nanpercentile(dummy, agg, axis=1)
+
+    dsx1 = pd.Series(dummy, index=pd.to_datetime(dsx.time.data))
+    dsx1.name = var
+    return dsx1
+
+
 def cli_weather_wrp(dummyp, dstart=None, dend=None):
+    '''
+    Wrapper for climate model output column names
+    :param dummyp: pandas data frame from climate model output
+    :param dstart: optional start date
+    :param dend: optional end date
+    :return: data frame with standard weather column names
+    '''
     cols = dummyp.columns.values
     cols[cols == 'tas'] = 'T'
     cols[cols == 'tasmax'] = 'Tmax'
@@ -166,10 +493,13 @@ def cli_weather_wrp(dummyp, dstart=None, dend=None):
     return dummyp1
 
 # wrapper for self-calibrating PDSI calculation
-def scPDSI(cts,awc=123,rs='1M'):
+def scPDSI(cts,awc=123,rs='1M',ETo='PM'):
     #this uses a conversion to inches! *0.0393701
     prcp = cts.Prec.resample(rs).sum().values * 0.0393701
-    pet = cts.EToHG.resample(rs).sum().values * 0.0393701
+    if ETo=='PM':
+        pet = cts.EToPM.resample(rs).sum().values * 0.0393701
+    else:
+        pet = cts.EToHG.resample(rs).sum().values * 0.0393701
     awc = awc * 0.0393701
     start_year = cts.index[10].year
     end_year = cts.index[-10].year
@@ -178,6 +508,109 @@ def scPDSI(cts,awc=123,rs='1M'):
     dummy.index = cts.Prec.resample(rs).sum().index
     dummy.columns = ['scpdsi', 'pdsi', 'phdi', 'pmdi', 'zindex']
     return dummy
+
+
+def scPDSI1M(cts, awc=123, ETo='PM'):
+    '''self-calibrating Palmer drought severity index
+    :param cts: climate time series (pandas data frame with time index)
+    :param awc: available soilwater content (float in mm)
+    :param ETo: PM for Penman Monteith else uses Hargreaves
+
+    Assumes about monthly input data.
+    Returns 5 columns of PDSI estimators
+    '''
+    # this uses a conversion to inches! *0.0393701
+    prcp = cts.Prec.values * 0.0393701
+    if ETo == 'PM':
+        pet = cts.EToPM.values * 0.0393701
+    else:
+        pet = cts.EToHG.values * 0.0393701
+    awc = awc * 0.0393701
+    start_year = cts.index[1].year
+    end_year = cts.index[-1].year
+    scpdsi, pdsi, phdi, pmdi, zindex = indices.scpdsi(prcp, pet, awc, start_year, start_year, end_year)
+    dummy = pd.DataFrame([scpdsi, pdsi, phdi, pmdi, zindex]).T
+    dummy.index = cts.index
+    dummy.columns = ['scpdsi', 'pdsi', 'phdi', 'pmdi', 'zindex']
+    return dummy
+
+# climate data aggregation specification
+def climate_tagg(x):
+    '''
+    Aggregation function wrapper.
+    Use cli_weather_wrp(data).resample('1M').apply(climate_tagg)
+    :param x: data frame with climate data
+    :return: resampled version
+    '''
+    names = {
+            'T': x['T'].mean(),
+            'Tmin': x['Tmin'].min(),
+            'Tmax': x['Tmax'].max(),
+            'Prec': x['Prec'].sum(),
+            'Rs': x['Rs'].sum(),
+            'RH': x['RH'].mean(),
+            'u2': x['u2'].mean(),
+            'vabar': x['vabar'].mean(),
+            'aP': x['aP'].mean(),
+            'EToPM': x['EToPM'].sum(),
+            'EToPM1': x['EToPM1'].sum(),
+            'EToHG': x['EToHG'].sum(),
+            'EToSJ': x['EToSJ'].sum(),
+            'EToPT': x['EToPT'].sum()}
+
+    return pd.Series(names, index=['T', 'Tmin', 'Tmax', 'Prec', 'Rs', 'RH', 'u2', 'vabar', 'aP', 'EToPM', 'EToPM1', 'EToHG', 'EToSJ', 'EToPT'])
+
+def cli_wrp1M(NSc, modi, mask, tres):
+    dummy = cordex_ts_m(NSc,modi,mask)
+    dummyr = cli_weather_wrp(dummy).resample(tres).apply(climate_tagg)
+    dummyr['scPDSIhg'] = scPDSI1M(dummyr,ETo='HG').scpdsi
+    dummyr['scPDSIpm'] = scPDSI1M(dummyr,ETo='PM').scpdsi
+    return dummyr
+
+def get_monthly_climate(NSc, mask, tres='1M', proj='CORDEX'):
+    firstitem = True
+    for i in np.arange(len(NSc.code.unique())):
+        try:
+            dummyx = cli_wrp1M(NSc, i, mask, tres)
+            dummyc = NSc.loc[NSc.code == NSc.code.unique()[i]].iloc[0]
+            if firstitem:
+                dummyxr = xr.Dataset({dummyc.code: xr.DataArray(dummyx, dims=['time', 'vars'],
+                                                                attrs={'model': dummyc.model,
+                                                                       'RCM': dummyc.RCM,
+                                                                       'RCP': dummyc.experiment,
+                                                                       'ensemble': dummyc.ensemble,
+                                                                       'Project': proj})})
+                firstitem = False
+            else:
+                dummyxr[dummyc.code] = xr.DataArray(dummyx, dims=['time', 'vars'],
+                                                    attrs={'model': dummyc.model,
+                                                           'RCM': dummyc.RCM,
+                                                           'RCP': dummyc.experiment,
+                                                           'ensemble': dummyc.ensemble,
+                                                           'Project': proj})
+            print('++ added ' + NSc.code.unique()[i])
+        except:
+            print('!! could not load ' + NSc.code.unique()[i])
+
+    return dummyxr
+
+
+def append_monthly_climate(NSc, mask, dummyxr, tres='1M', proj='CORDEX'):
+    for i in np.arange(len(NSc.code.unique())):
+        try:
+            dummyx = cli_wrp1M(NSc, i, mask, tres)
+            dummyc = NSc.loc[NSc.code == NSc.code.unique()[i]].iloc[0]
+            dummyxr[dummyc.code] = xr.DataArray(dummyx, dims=['time', 'vars'],
+                                                attrs={'model': dummyc.model,
+                                                       'RCM': dummyc.RCM,
+                                                       'RCP': dummyc.experiment,
+                                                       'ensemble': dummyc.ensemble,
+                                                       'Project': proj})
+            print('++ added ' + NSc.code.unique()[i])
+        except:
+            print('!! could not load ' + NSc.code.unique()[i])
+
+    return dummyxr
 
 
 # build weather weights
